@@ -1,0 +1,441 @@
+name: Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+jobs:
+  code-review:
+    # Advisory, non-blocking code review
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        # (Already pinned) Good practice to pin third-party actions by commit SHAs
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+        # Decide if we can run the review (secrets present & not a fork PR)
+      - name: Determine review eligibility
+        id: eligibility
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Gathering PR context..."
+          echo "Repository: ${{ github.repository }}"
+          echo "PR number: ${{ github.event.pull_request.number }}"
+          echo "Fork: ${{ github.event.pull_request.head.repo.fork }}"
+
+          REVIEW_ENABLED=true
+          SKIP_REASON=""
+
+          # Size gate (GitHub payload can be stale; recompute)
+          PR_CHANGED_FILES="$(gh pr view ${{ github.event.pull_request.number }} --json changedFiles -q .changedFiles 2>/dev/null || true)"
+          if [ -z "${PR_CHANGED_FILES}" ]; then
+            PR_CHANGED_FILES="$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} -q .changed_files 2>/dev/null || echo 0)"
+          fi
+          PR_CHANGED_FILES="${PR_CHANGED_FILES:-0}"
+          echo "Changed files: ${PR_CHANGED_FILES}"
+
+          MAX_FILES=20
+          if [ "$PR_CHANGED_FILES" -gt "$MAX_FILES" ]; then
+            REVIEW_ENABLED=false
+            SKIP_REASON="PR has ${PR_CHANGED_FILES} changed files (>${MAX_FILES})."
+          fi
+
+          # Forks don't receive secrets
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            REVIEW_ENABLED=false
+            SKIP_REASON="${SKIP_REASON:+$SKIP_REASON }PR comes from a fork; repository secrets are not available."
+          fi
+
+          # Required secret present?
+          if [ -z "${{ secrets.CURSOR_API_KEY }}" ]; then
+            REVIEW_ENABLED=false
+            SKIP_REASON="${SKIP_REASON:+$SKIP_REASON }CURSOR_API_KEY repository secret is not set."
+          fi
+
+          echo "REVIEW_ENABLED=$REVIEW_ENABLED" >> "$GITHUB_ENV"
+          echo "SKIP_REASON=$SKIP_REASON" >> "$GITHUB_ENV"
+
+          {
+            echo "### Code Review Eligibility"
+            echo "- Changed files: ${PR_CHANGED_FILES}"
+            echo "- Fork: ${{ github.event.pull_request.head.repo.fork }}"
+            if [ "$REVIEW_ENABLED" = "true" ]; then
+              echo "- ✅ Eligible: secrets available, not a fork, and PR size ≤ ${MAX_FILES}."
+            else
+              echo "- ⏭️ Skipped: $SKIP_REASON"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "REVIEW_ENABLED=${REVIEW_ENABLED}"
+          echo "SKIP_REASON=${SKIP_REASON:-none}"
+
+      - name: Cache Cursor CLI
+        if: env.REVIEW_ENABLED == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cursor/bin
+          key: cursor-cli-${{ runner.os }}-v1.5
+          restore-keys: |
+            cursor-cli-${{ runner.os }}-
+
+      - name: Install Cursor CLI (if missing)
+        if: env.REVIEW_ENABLED == 'true'
+        run: |
+          set -euo pipefail
+
+          BIN_DIR="$HOME/.local/bin"
+          mkdir -p "$BIN_DIR"
+
+          if [ -x "$BIN_DIR/cursor-agent" ]; then
+            echo "Cursor CLI found in cache, skipping installation"
+          else
+            echo "Installing Cursor CLI v1.5"
+            CURSOR_VERSION="1.5"
+            TMP_DIR="$(mktemp -d)"
+            trap 'rm -rf "$TMP_DIR"' EXIT
+
+            # --- Download installer (basic hardening) ---
+            curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+              "https://cursor.com/install?version=${CURSOR_VERSION}" -o "$TMP_DIR/cursor-install.sh"
+
+            # --- Sanity checks (checksum preferred if vendor provides) ---
+            head -1 "$TMP_DIR/cursor-install.sh" | grep -qE '^#!' || { echo "Installer missing shebang"; exit 1; }
+            grep -q 'cursor-agent' "$TMP_DIR/cursor-install.sh" || { echo "Installer does not reference cursor-agent"; exit 1; }
+
+            bash "$TMP_DIR/cursor-install.sh"
+          fi
+
+          echo "$BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Verify Cursor CLI installation
+        if: env.REVIEW_ENABLED == 'true'
+        run: |
+          which cursor-agent || { echo "cursor-agent not found in PATH"; exit 1; }
+          ls -la "$HOME/.local/bin/"
+
+      - name: Configure Cursor CLI (headless auth)
+        if: env.REVIEW_ENABLED == 'true'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cursor"
+          cat > "$HOME/.cursor/cli.json" <<JSON
+          {"api_key":"${CURSOR_API_KEY}"}
+          JSON
+          chmod 600 "$HOME/.cursor/cli.json"
+
+      - name: Configure git identity
+        if: env.REVIEW_ENABLED == 'true'
+        run: |
+          git config user.name "Cursor Agent"
+          git config user.email "cursoragent@cursor.com"
+
+      - name: Install GH CLI
+        uses: dev-hanz-ops/install-gh-cli-action@v0.2.1
+        with:
+          gh-cli-version: 2.65.0 # optional, see action.yml for current default
+
+      - name: Perform automated code review (non-blocking)
+        if: env.REVIEW_ENABLED == 'true'
+        timeout-minutes: 10
+        continue-on-error: true
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          TERM: dumb
+          NO_COLOR: '1'
+          MODEL: sonnet-4.5
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BLOCKING_REVIEW: ${{ vars.BLOCKING_REVIEW || 'false' }}
+          CRITICAL_ISSUES_FOUND: ${{ vars.CRITICAL_ISSUES_FOUND || 'false' }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cursor/bin:$PATH"
+
+          # --- Build prompt for the agent (no shell expansion inside heredoc) ---
+          PROMPT="$(cat << 'EOF'
+          You are operating headless in a GitHub Actions runner performing automated code review. The gh CLI is available and authenticated via GH_TOKEN. You may comment on pull requests.
+          Context:
+          - Repo: ${{ github.repository }}
+          - PR Number: ${{ github.event.pull_request.number }}
+          - PR Head SHA: ${{ github.event.pull_request.head.sha }}
+          - PR Base SHA: ${{ github.event.pull_request.base.sha }}
+
+          Objectives:
+          1) Re-check existing review comments and reply resolved when addressed.
+          2) Review the current PR diff and flag only clear, high-severity issues.
+          3) Leave very short inline comments (1-2 sentences) on changed lines only and a brief summary at the end.
+
+          Constraints:
+          - Because you are running headless you must terminate immediately after you finish your summary report.
+
+          Procedure:
+          - Get existing comments: gh pr view --json comments
+          - Get diff (restrict review scope): gh pr diff --name-only | grep -E "\\.py$" | grep "^src/" | grep -v test
+          - Get changed files with patches to compute inline positions:
+            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files --paginate \
+              --jq '.[] | select(.filename | test("\\.py$")) | select(.filename | test("^src/") and (test("test") | not)) | {filename,patch}'
+          - Compute exact inline anchors for each issue (file path + diff position). Comments MUST be inline on changed lines.
+          - Detect prior top-level "no issues" comments authored by this bot ("✅ no issues", "No issues found", "LGTM").
+          - If CURRENT run finds issues and a prior "no issues" comment exists:
+              - Try to delete via: gh api -X DELETE repos/${{ github.repository }}/issues/comments/<comment_id>
+              - If not possible, minimize via GraphQL (minimizeComment) or reply "⚠️ Superseded: issues were found in newer commits".
+          - If a previously reported issue appears fixed by nearby changes, reply: ✅ This issue appears to be resolved by the recent changes
+          - Analyze ONLY:
+            - Null/undefined dereferences
+            - Resource leaks (unclosed files or connections)
+            - Injection (SQL/XSS)
+            - Concurrency/race conditions
+            - Missing error handling for critical operations
+            - Obvious logic errors with incorrect behavior
+            - Clear performance anti-patterns with measurable impact
+            - Definitive security vulnerabilities
+          - Avoid duplicates: skip if similar feedback already exists on or near the same lines.
+          - Then STOP. Do not wait for follow-ups.
+
+
+          Commenting rules:
+          - All findings MUST be submitted as **inline review comments** on the Files changed tab.
+          - Use the GitHub Reviews API with a `comments` array: each item requires "path" and "position" (diff position) plus a short "body".
+          - NEVER report issues via top-level PR comments or review body only. If you cannot determine a valid diff position, SKIP that finding.
+          - Max 10 inline comments total; prioritize the most critical issues.
+          - One issue per comment; place on the exact changed line.
+          - Natural tone, specific and actionable; do not mention automation.
+          - Use emojis: 🚨 Critical 🔒 Security ⚡ Performance ⚠️ Logic ✅ Resolved ✨ Improvement
+
+          Anchoring rules (RIGHT side only):
+          - Anchor to the NEW code (RIGHT column of the diff). Do not comment on removed lines.
+          - Preferred: create comments with `line` and `side:"RIGHT"` anchored to `commit_id:${{ github.event.pull_request.head.sha }}` via:
+            POST /repos/{owner}/{repo}/pulls/{pull_number}/comments  (fields: path, commit_id, line, side="RIGHT", body)
+          - If you choose to create ONE review with multiple comments, you MUST compute `position` values from the PR file patches so they point to the RIGHT side. Skip any finding you cannot position correctly.
+          - Never use `side:"LEFT"` or a `position` that points to removed lines. If you are unsure, skip the finding.
+
+          Submission:
+          - If there are NO issues to report and an existing top-level comment indicating "no issues" already exists (e.g., "✅ no issues", "No issues found", "LGTM"), do NOT submit another comment. Skip submission to avoid redundancy.
+          - If there are NO issues to report and NO prior "no issues" comment exists, submit one brief summary comment noting no issues.
+          - If there ARE issues, submit ONE review with ONLY inline comments, plus an optional short summary body. Do not use "REQUEST_CHANGES"; use event=COMMENT.
+          - Do NOT use `gh pr review --request-changes`; do NOT post issue-level comments for findings.
+          - You MUST NOT use "REQUEST_CHANGES".
+          - Do not block merging under any circumstances.
+
+          Output contract (for the outer shell; informational only):
+            - Print a single line at the end starting with "RESULT: " followed by a JSON object like:
+              {"issues_found": true, "inline_count": 3}
+          EOF
+          )"
+
+          # --- Files for streaming + result handoff ---
+          : > agent_output.log
+          : > agent_result.json
+
+          REPO="${{ github.repository }}"
+          PR="${{ github.event.pull_request.number }}"
+
+          START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Run started at: $START"
+          # Expose START to later steps
+          echo "START=$START" >> "$GITHUB_ENV"
+
+          BASE_INLINE_COUNT="$(
+            gh api "repos/${REPO}/pulls/${PR}/comments?per_page=100" --paginate | jq 'length'
+          )"
+
+          # --- Launch agent (foreground), stream logs, show live counts ---
+          set +e
+          cursor-agent --force --model "$MODEL" --output-format=text --print "$PROMPT" \
+            < /dev/null >> agent_output.log 2>&1 &
+          AGENT_PID=$!
+
+          # Live-stream agent logs to console while keeping the file
+          tail -n +1 -F agent_output.log 2>&1 &
+          TAIL_PID=$!
+
+          # --- Watchdog: end when comments land or output idles ---
+          last_mtime=$(stat -c %Y agent_output.log)
+          idle_secs=0
+          max_secs=480
+
+          for ((i=0; i<max_secs; i++)); do
+            inline_now="$(
+              gh api "repos/${REPO}/pulls/${PR}/comments?per_page=100" --paginate | jq 'length'
+            )"
+            if [ "$inline_now" -gt "$BASE_INLINE_COUNT" ]; then
+              break
+            fi
+            mtime=$(stat -c %Y agent_output.log)
+            if [ "$mtime" -eq "$last_mtime" ]; then
+              idle_secs=$((idle_secs+1))
+            else
+              idle_secs=0
+              last_mtime=$mtime
+            fi
+            if [ "$idle_secs" -ge 60 ]; then
+              break
+            fi
+
+            if ! kill -0 "$AGENT_PID" 2>/dev/null; then
+              break
+            fi
+
+            sleep 1
+          done
+
+          # --- Stop agent + helpers ---
+          kill -TERM "$AGENT_PID" 2>/dev/null || true
+          sleep 2
+          kill -KILL "$AGENT_PID" 2>/dev/null || true
+          wait "$AGENT_PID" 2>/dev/null || true
+
+          kill "$TAIL_PID" 2>/dev/null || true
+
+          # --- Poll for new inline comments created since START (bridge API lag) ---
+          BOT_LOGINS='["github-actions[bot]","cursor-bot"]'  # adjust if your bot user differs
+          POLL_LIMIT=45
+          NEW_INLINE=0
+
+          for i in $(seq 1 "$POLL_LIMIT"); do
+            NEW_INLINE="$(
+              gh api "repos/${REPO}/pulls/${PR}/comments?per_page=100" --paginate \
+                | jq --arg start "$START" --argjson bots "$BOT_LOGINS" '
+                    [ .[]
+                      | select(.created_at >= $start)
+                      | ( if ($bots|length)>0 then select(.user.login as $u | any($bots[]; . == $u)) else . end )
+                    ] | length
+                  '
+            )" || NEW_INLINE=0
+
+            [ "${NEW_INLINE:-0}" -gt 0 ] && break
+            sleep 1
+          done
+
+          jq -n --argjson n "${NEW_INLINE:-0}" '{issues_found:( $n>0 ), inline_count:$n}' > agent_result.json
+
+          echo ""
+          echo "Code review step finished (non-blocking)."
+
+      # No blocking gate: this job never fails based on findings. It only posts suggestions.
+      - name: Enforce inline-only placement (cleanup stray top-level comments)
+        if: env.REVIEW_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # START is exported by the previous step; if not present, default to now
+          START="${START:-}"
+          if [ -z "$START" ]; then
+            START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+          REPO="${{ github.repository }}"
+          PR="${{ github.event.pull_request.number }}"
+
+          # Detect top-level (issue) comments authored by this workflow since START
+          my_login="$(gh api user -q .login 2>/dev/null || echo github-actions[bot])"
+          # Remove any mis-anchored (LEFT-side) review comments authored by this token since START
+          left_ids="$(
+            gh api "repos/${REPO}/pulls/${PR}/comments?per_page=100" --paginate \
+            | jq -r --arg start "$START" --arg me "$my_login" '
+            .[]
+            | select(.created_at >= $start)
+            | select(.user.login == $me)
+            | select(.side != "RIGHT")
+            | .id
+            '
+          )"
+          if [ -n "$left_ids" ]; then
+            echo "Removing mis-anchored LEFT-side review comments posted by $my_login in this run..."
+            while IFS= read -r rid; do
+              [ -z "$rid" ] && continue
+              gh api -X DELETE "repos/${REPO}/pulls/comments/${rid}" || true
+            done <<< "$left_ids"
+          fi
+
+          # Compute NEW_INLINE counting RIGHT-side comments only
+          NEW_INLINE="$(
+            gh api "repos/${REPO}/pulls/${PR}/comments?per_page=100" --paginate \
+            | jq --arg start "$START" --arg me "$my_login" '
+            [ .[]
+                | select(.created_at >= $start)
+                  | select(.user.login == $me)
+                  | select(.side == "RIGHT")
+                  ] | length
+                  '
+              )"
+          NEW_INLINE=${NEW_INLINE:-0}
+          # (after computing NEW_INLINE and before collecting stray_ids)
+          stray_ids=""   # avoid set -u unbound var
+          if [ "$NEW_INLINE" -gt 0 ]; then
+            # Only when there ARE inline findings do we remove bot-authored top-level comments from this run
+            stray_ids="$(
+              gh api "repos/${REPO}/issues/${PR}/comments?per_page=100" --paginate \
+              | jq -r --arg start "$START" --arg me "$my_login" '
+                .[]
+                | select(.created_at >= $start)
+                | select(.user.login == $me)
+                | .id
+              '
+            )"
+            if [ -n "$stray_ids" ]; then
+              echo "Removing stray top-level comments posted by $my_login in this run (inline findings present)..."
+              while IFS= read -r cid; do
+                [ -z "$cid" ] && continue
+                gh api -X DELETE "repos/${REPO}/issues/comments/${cid}" || true
+              done <<< "$stray_ids"
+            fi
+          fi
+
+          echo "::notice title=Inline review summary::Inline comments created in this run: $NEW_INLINE"
+
+          # Persist the inline count into agent_result.json (or create it)
+          if [ -s agent_result.json ]; then
+            jq --argjson n "$NEW_INLINE" '
+              .inline_count = ($n) |
+              .issues_found = ($n > 0)
+            ' agent_result.json > agent_result.json.tmp && mv agent_result.json.tmp agent_result.json
+          else
+            jq -n --argjson n "$NEW_INLINE" '{issues_found:( $n>0 ), inline_count:$n}' > agent_result.json
+          fi
+      - name: Summarize skipped review
+        if: env.REVIEW_ENABLED != 'true'
+        run: |
+          echo "RESULT: {\"issues_found\": false, \"inline_count\": 0, \"skipped\": true}" | tee agent_output.log
+          {
+            echo "### Code Review Summary"
+            echo ""
+            echo "- ⏭️ Review skipped."
+            echo "- Reason: ${SKIP_REASON:-Unknown}"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Summarize code review results
+        run: |
+          set -euo pipefail
+          if [ -s agent_result.json ]; then
+            RESULT_JSON="$(cat agent_result.json)"
+          else
+            RESULT_JSON='{"issues_found": false, "inline_count": 0}'
+          fi
+
+          echo "🔎 Code review summary:"
+          echo "$RESULT_JSON" | jq .
+
+          {
+            echo "### Code Review Summary"
+            echo ""
+            echo '```json'
+            echo "$RESULT_JSON" | jq .
+            echo '```'
+            echo ""
+            echo "<details><summary>Agent log (last 200 lines)</summary>"
+            echo
+            echo '```text'
+            tail -n 200 agent_output.log || true
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
